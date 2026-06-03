@@ -1,26 +1,18 @@
 """
-RunPod serverless handler for Video Subtitle Extractor (VSE).
+RunPod serverless handler — burned-in subtitle OCR via PaddleOCR.
 
-Key design decisions:
-- Pre-crops the video to the subtitle zone (bottom 22% of frame) BEFORE
-  running OCR. This eliminates channel logos (TRT 1), watermarks (ForumKa),
-  episode titles, and "Directed by" credits that appear outside the sub zone.
-- Calls backend/main.py (headless), not main.py (PySide6 GUI).
+Bypasses VSE's interactive main.py entirely. Instead:
+  1. Pre-crops video to bottom 22% (subtitle zone) — eliminates logos/watermarks.
+  2. Extracts frames at 2 fps with ffmpeg.
+  3. Runs PaddleOCR on each frame (GPU-accelerated).
+  4. Groups consecutive frames with identical text into SRT cues.
 
-Input payload:
-  {
-    "video_url":      "<presigned R2 GET URL>",
-    "language":       "en"    (optional, default "en"),
-    "sub_area_ratio": 0.22    (optional, fraction of frame height from bottom)
-  }
-
-Output:
-  {"ok": true,  "srt": "<srt content>", "cue_count": N}
-  {"ok": false, "error": "<message>"}
+Input:  {"video_url": "<R2 presigned URL>", "language": "en"}
+Output: {"ok": true, "srt": "<srt text>", "cue_count": N}
+        {"ok": false, "error": "<message>"}
 """
 
 import glob
-import json
 import logging
 import os
 import subprocess
@@ -28,113 +20,172 @@ import tempfile
 
 import runpod
 
-logger = logging.getLogger("vse_handler")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("handler")
 
-VSE_DIR = os.environ.get("VSE_DIR", "/app/vse")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _tc(ms):
+    ms = max(0, int(ms))
+    h = ms // 3600000; ms %= 3600000
+    m = ms // 60000;   ms %= 60000
+    s = ms // 1000;    ms %= 1000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def _download(url, dest):
-    result = subprocess.run(
+    r = subprocess.run(
         ["wget", "-q", "--timeout=120", "-O", dest, url],
         capture_output=True, text=True,
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"wget failed: {result.stderr[:500]}")
+    if r.returncode != 0:
+        raise RuntimeError(f"wget: {r.stderr[:400]}")
 
 
-def _crop_to_subtitle_zone(src, dest, ratio):
-    """
-    Crop video to the bottom `ratio` fraction of the frame.
-    e.g. ratio=0.22 → bottom 22% only (where subtitles live).
-    Removes top-corner logos, watermarks, episode title cards.
-    Audio is stream-copied unchanged.
-    """
-    start = 1.0 - ratio          # e.g. 0.78 — top of the crop window
-    cmd = [
+def _crop_subtitle_zone(src, dest, ratio=0.22):
+    """Keep only the bottom `ratio` of the frame — subtitle lives here."""
+    top = 1.0 - ratio
+    r = subprocess.run([
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", src,
-        "-vf", f"crop=in_w:in_h*{ratio}:0:in_h*{start}",
-        "-c:a", "copy",
-        dest,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg crop failed: {result.stderr[:400]}")
+        "-vf", f"crop=in_w:in_h*{ratio}:0:in_h*{top}",
+        "-c:a", "copy", dest,
+    ], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"crop: {r.stderr[:300]}")
 
+
+def _extract_frames(video, frames_dir, fps=2):
+    """Dump frames at `fps` into frames_dir as JPEGs."""
+    os.makedirs(frames_dir, exist_ok=True)
+    subprocess.run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", video,
+        "-vf", f"fps={fps}",
+        os.path.join(frames_dir, "f%06d.jpg"),
+    ], check=True)
+
+
+def _ocr_frames(frames_dir, language, fps=2):
+    """
+    Run PaddleOCR on every frame, return list of (timestamp_ms, text).
+    GPU is used automatically when available.
+    """
+    from paddleocr import PaddleOCR
+    ocr = PaddleOCR(
+        use_angle_cls=False,
+        lang=language,
+        show_log=False,
+        use_gpu=True,
+    )
+
+    ms_per_frame = int(1000 / fps)
+    rows = []
+
+    frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    logger.info("OCR on %d frames...", len(frames))
+
+    for idx, path in enumerate(frames):
+        ts = idx * ms_per_frame
+        try:
+            result = ocr.ocr(path, cls=False)
+        except Exception as exc:
+            logger.warning("OCR frame %d error: %s", idx, exc)
+            continue
+        if not result or not result[0]:
+            continue
+        parts = []
+        for line in result[0]:
+            if not line or len(line) < 2:
+                continue
+            text, conf = line[1][0], line[1][1]
+            if conf >= 0.6 and len(text.strip()) >= 2:
+                parts.append(text.strip())
+        if parts:
+            rows.append((ts, " ".join(parts)))
+
+    return rows
+
+
+def _rows_to_srt(rows, fps=2):
+    """Merge consecutive identical text into SRT cues."""
+    if not rows:
+        return ""
+
+    ms_per_frame = int(1000 / fps)
+    cues = []
+    cur_text  = rows[0][1]
+    cur_start = rows[0][0]
+    cur_end   = rows[0][0] + ms_per_frame
+
+    for ts, text in rows[1:]:
+        if text == cur_text and ts <= cur_end + ms_per_frame * 2:
+            cur_end = ts + ms_per_frame
+        else:
+            if cur_end - cur_start >= 300:
+                cues.append((cur_start, cur_end, cur_text))
+            cur_text  = text
+            cur_start = ts
+            cur_end   = ts + ms_per_frame
+
+    if cur_end - cur_start >= 300:
+        cues.append((cur_start, cur_end, cur_text))
+
+    lines = []
+    for i, (s, e, t) in enumerate(cues, 1):
+        lines += [str(i), f"{_tc(s)} --> {_tc(e)}", t, ""]
+    return "\n".join(lines)
+
+
+# ── Handler ───────────────────────────────────────────────────────────────────
 
 def handler(job):
-    inp            = job.get("input", {})
-    video_url      = inp.get("video_url")
-    language       = inp.get("language", "en")
-    sub_area_ratio = float(inp.get("sub_area_ratio", 0.22))
+    inp       = job.get("input", {})
+    video_url = inp.get("video_url")
+    language  = inp.get("language", "en")
 
     if not video_url:
         return {"ok": False, "error": "video_url required"}
 
     with tempfile.TemporaryDirectory() as tmp:
-        raw_path     = os.path.join(tmp, "chunk.mp4")
-        cropped_path = os.path.join(tmp, "chunk_cropped.mp4")
-        out_dir      = os.path.join(tmp, "out")
-        os.makedirs(out_dir)
+        raw      = os.path.join(tmp, "chunk.mp4")
+        cropped  = os.path.join(tmp, "cropped.mp4")
+        frames   = os.path.join(tmp, "frames")
 
-        # 1 — Download chunk from R2
+        # 1 — Download
         try:
             logger.info("Downloading chunk...")
-            _download(video_url, raw_path)
-        except Exception as exc:
-            return {"ok": False, "error": f"download failed: {exc}"}
+            _download(video_url, raw)
+            logger.info("%.1f MB", os.path.getsize(raw) / 1e6)
+        except Exception as e:
+            return {"ok": False, "error": f"download: {e}"}
 
-        size_mb = os.path.getsize(raw_path) / 1024 / 1024
-        logger.info("Downloaded %.1f MB", size_mb)
-
-        # 2 — Crop to subtitle zone (removes logos/watermarks outside the zone)
+        # 2 — Crop to subtitle zone
         try:
-            logger.info("Cropping to bottom %.0f%% of frame...", sub_area_ratio * 100)
-            _crop_to_subtitle_zone(raw_path, cropped_path, sub_area_ratio)
-        except Exception as exc:
-            logger.warning("Crop failed (%s) — using full frame", exc)
-            cropped_path = raw_path   # fallback: use uncropped
+            _crop_subtitle_zone(raw, cropped)
+        except Exception as e:
+            logger.warning("Crop failed (%s) — using full frame", e)
+            cropped = raw
 
-        # 3 — Run VSE headless (backend/main.py, not main.py which is the PySide6 GUI)
+        # 3 — Extract frames at 2 fps
         try:
-            result = subprocess.run(
-                [
-                    "python", "backend/main.py",
-                    "-i", cropped_path,
-                    "-o", out_dir,
-                    "--language", language,
-                ],
-                cwd=VSE_DIR,
-                capture_output=True,
-                text=True,
-                timeout=840,
-            )
-            if result.returncode != 0:
-                logger.warning("VSE stderr: %s", result.stderr[:1000])
-                return {
-                    "ok": False,
-                    "error": f"VSE exit {result.returncode}: {result.stderr[:500]}",
-                }
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": "VSE timed out after 840s"}
-        except Exception as exc:
-            return {"ok": False, "error": f"VSE error: {exc}"}
+            _extract_frames(cropped, frames, fps=2)
+        except Exception as e:
+            return {"ok": False, "error": f"frame extraction: {e}"}
 
-        # 4 — Collect SRT output
-        srts = (
-            glob.glob(os.path.join(out_dir, "**", "*.srt"), recursive=True)
-            or glob.glob(os.path.join(out_dir, "*.srt"))
-        )
-        if not srts:
-            logger.warning("VSE stdout: %s", result.stdout[:500])
-            return {"ok": False, "error": "VSE produced no .srt file"}
+        # 4 — OCR
+        try:
+            rows = _ocr_frames(frames, language, fps=2)
+        except Exception as e:
+            return {"ok": False, "error": f"OCR: {e}"}
 
-        srt_content = open(srts[0], encoding="utf-8", errors="replace").read()
-        cue_count   = len([l for l in srt_content.splitlines() if l.strip().isdigit()])
-        logger.info("VSE complete: %d cues", cue_count)
+        # 5 — Build SRT
+        srt = _rows_to_srt(rows, fps=2)
+        cue_count = srt.count("\n\n")
+        logger.info("Done: %d cues", cue_count)
 
-        return {"ok": True, "srt": srt_content, "cue_count": cue_count}
+        return {"ok": True, "srt": srt, "cue_count": cue_count}
 
 
 runpod.serverless.start({"handler": handler})
