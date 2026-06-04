@@ -121,7 +121,7 @@ def _detect_subtitle_band(video_path, ocr, sample_count=20):
 
 # ── Phase 2: keyframe-aware extraction ───────────────────────────────────────
 
-def _frames_changed(prev, curr, threshold=0.08):
+def _frames_changed(prev, curr, threshold=0.06):
     """
     Return True if curr frame is different enough from prev to warrant OCR.
     Compares the mean absolute difference of the subtitle crop.
@@ -145,19 +145,21 @@ def _extract_and_ocr(video_path, ocr, y_top, y_bottom, language):
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     logger.info("Processing %d frames at %.1f fps", total, fps)
 
-    rows     = []
-    prev_crop = None
-    frame_idx = 0
+    rows            = []
+    prev_crop       = None
+    subtitle_active = False   # tighten threshold when subtitle is on screen
+    frame_idx       = 0
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        ts_ms = int(frame_idx / fps * 1000)
-        crop  = frame[y_top:y_bottom, :]
+        ts_ms     = int(frame_idx / fps * 1000)
+        crop      = frame[y_top:y_bottom, :]
+        threshold = 0.02 if subtitle_active else 0.06
 
-        if _frames_changed(prev_crop, crop):
+        if _frames_changed(prev_crop, crop, threshold):
             try:
                 result = ocr.ocr(crop, cls=False)
             except Exception:
@@ -170,9 +172,18 @@ def _extract_and_ocr(video_path, ocr, y_top, y_bottom, language):
                         continue
                     text, conf = line[1][0], line[1][1]
                     if conf >= 0.60 and len(text.strip()) >= 2:
+                        # Skip lines that are mostly non-Latin (Turkish credits,
+                        # Arabic watermarks, etc.) — keep English only
+                        non_latin = sum(1 for c in text if c.lower() in
+                            set("ğşıöüçÖÜİŞĞÇαβγδεζηθκλμνξοπρστυφχψωабвгдеёжзийклмнопрстуфхцчшщъыьэюяأبتثجحخدذرزسشصضطظعغفقكلمنهوي"))
+                        if len(text) > 0 and non_latin / len(text) > 0.15:
+                            continue
                         parts.append(text.strip())
                 if parts:
                     rows.append((ts_ms, " ".join(parts)))
+                    subtitle_active = True
+                else:
+                    subtitle_active = False
 
             prev_crop = crop.copy()
 
