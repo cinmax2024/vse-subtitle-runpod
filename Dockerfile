@@ -1,41 +1,40 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Dockerfile for VSE (Video Subtitle Extractor) RunPod serverless endpoint.
+#
+# Build:
+#   docker build -f Dockerfile.vse -t youruser/vse-runpod:latest .
+#   docker push youruser/vse-runpod:latest
+#
+# RunPod setup:
+#   Serverless → New Endpoint → paste your image → GPU: T4 or A10G
+#   Min workers: 0, Max workers: 4 (matches VSE_PARALLEL_CHUNKS in .env)
+#   Copy the endpoint ID → set RUNPOD_VSE_ENDPOINT in .env
 
-ENV DEBIAN_FRONTEND=noninteractive
+FROM paddlepaddle/paddle:2.6.0-gpu-cuda11.7-cudnn8.4-trt8.4
 
-RUN apt-get update && apt-get install -y \
-    python3.10 python3-pip \
-    ffmpeg libgl1-mesa-glx libglib2.0-0 wget git libgomp1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
-    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1 \
+# System deps: OpenCV headless, wget, git, ffmpeg
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        wget \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip BEFORE installing Paddle — Ubuntu's bundled pip is too old to
-# resolve Paddle's wheel metadata correctly and silently picks wrong builds.
-RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
-
-# PaddlePaddle GPU for CUDA 11.8.
-# Use the cu118-specific index (-i), NOT the MKL/AVX page (-f) which is CPU-only.
-# No version pin — gets the latest stable GPU wheel for cu118 (3.0.0 or newer).
-RUN python -m pip install --no-cache-dir paddlepaddle-gpu \
-    -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
-
+# Clone VSE (shallow, saves ~150 MB)
 RUN git clone --depth 1 \
-    https://github.com/YaoFANGUK/video-subtitle-extractor.git /app/vse
+    https://github.com/YaoFANGUK/video-subtitle-extractor.git \
+    /app/vse
 
-# Install paddleocr with --no-deps so pip cannot downgrade our GPU paddle
-# to the CPU build when resolving paddleocr's declared paddle dependency.
-RUN python -m pip install --no-cache-dir "paddleocr~=3.4.0" --no-deps
+# Install VSE deps while preserving the Paddle 2.x GPU runtime in the base image.
+# Upstream VSE now asks for PaddleOCR 3.x, but this worker code uses the 2.x API.
+RUN grep -vE "^(paddlepaddle|paddleocr|pyside6|pyside6-fluent-widgets|je-showinfilemanager|numpy)" \
+        /app/vse/requirements.txt > /tmp/requirements-vse-headless.txt && \
+    pip install --no-cache-dir -r /tmp/requirements-vse-headless.txt && \
+    pip install --no-cache-dir "numpy<2" "paddleocr==2.7.3" && \
+    pip install --no-cache-dir runpod
 
-# Remaining VSE deps — three package groups are skipped:
-#   paddlepaddle / paddleocr — already installed above
-#   pyside6 / pyside6-fluent-widgets — Qt6 GUI, requires a display, fails headless
-#   je-showinfilemanager — desktop file-manager helper, also fails headless
-RUN grep -vE "^(paddlepaddle|paddleocr|pyside6|je-showinfilemanager)" \
-        /app/vse/requirements.txt > /tmp/req.txt && \
-    python -m pip install --no-cache-dir -r /tmp/req.txt
-
-RUN python -m pip install --no-cache-dir runpod
-
+# Copy RunPod handler
 COPY handler.py /app/handler.py
 
 ENV VSE_DIR=/app/vse
